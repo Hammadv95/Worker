@@ -34,10 +34,21 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import BooleanObject, NameObject
 
 # ── Config ─────────────────────────────────────────────────────────────
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SERVICE_ROLE = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-DB_URL       = os.environ["SUPABASE_DB_URL"]
+# Read env at module load but never raise at import time — Vercel's
+# FUNCTION_INVOCATION_FAILED is opaque and hides the real cause. Instead we
+# check inside the handler and return a helpful 500 with the missing var name.
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SERVICE_ROLE = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+DB_URL       = os.environ.get("SUPABASE_DB_URL", "")
 CRON_SECRET  = os.environ.get("CRON_SECRET")
+
+
+def _missing_env():
+    missing = []
+    if not SUPABASE_URL: missing.append("SUPABASE_URL")
+    if not SERVICE_ROLE: missing.append("SUPABASE_SERVICE_ROLE_KEY")
+    if not DB_URL:       missing.append("SUPABASE_DB_URL")
+    return missing
 
 TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "templates", "acord25-2016-03.pdf")
 BUCKET   = "coi-pdfs"
@@ -358,6 +369,9 @@ class handler(BaseHTTPRequestHandler):
         return auth == f"Bearer {CRON_SECRET}"
 
     def _handle(self):
+        missing = _missing_env()
+        if missing:
+            return self._write(500, {"error": f"missing env vars: {', '.join(missing)}"})
         if not self._authorized():
             return self._write(401, {"error": "unauthorized"})
         batch_size = int(os.environ.get("BATCH_SIZE", "10"))
