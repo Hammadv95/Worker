@@ -28,10 +28,16 @@ import sys
 import traceback
 from typing import Optional
 
-import psycopg
-import requests
-from pypdf import PdfReader, PdfWriter
-from pypdf.generic import BooleanObject, NameObject
+# Defer heavy third-party imports so that a missing/broken dependency yields
+# a readable JSON 500 instead of Vercel's opaque FUNCTION_INVOCATION_FAILED.
+_import_error: Optional[str] = None
+try:
+    import psycopg  # noqa: F401
+    import requests  # noqa: F401
+    from pypdf import PdfReader, PdfWriter  # noqa: F401
+    from pypdf.generic import BooleanObject, NameObject  # noqa: F401
+except Exception as _e:  # noqa: BLE001
+    _import_error = f"{type(_e).__name__}: {_e}"
 
 # ── Config ─────────────────────────────────────────────────────────────
 # Read env at module load but never raise at import time — Vercel's
@@ -369,11 +375,15 @@ class handler(BaseHTTPRequestHandler):
         return auth == f"Bearer {CRON_SECRET}"
 
     def _handle(self):
+        if _import_error:
+            return self._write(500, {"error": f"import failed: {_import_error}"})
         missing = _missing_env()
         if missing:
             return self._write(500, {"error": f"missing env vars: {', '.join(missing)}"})
         if not self._authorized():
             return self._write(401, {"error": "unauthorized"})
+        if not os.path.exists(TEMPLATE_PATH):
+            return self._write(500, {"error": f"template missing at {TEMPLATE_PATH}"})
         batch_size = int(os.environ.get("BATCH_SIZE", "10"))
         try:
             result = drain_queue(batch_size)
