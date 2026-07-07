@@ -1,7 +1,7 @@
 {
   "crons": [
     {
-      "path": "/api/render-queue",
+      "path": "/api/render_queue",
       "schedule": "*/1 * * * *"
     }
   ]

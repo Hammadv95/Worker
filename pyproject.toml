@@ -1,0 +1,8 @@
+[project]
+name = "coi-worker"
+version = "0.1.0"
+description = "Vercel Cron worker that renders Golden by Corgi ACORD 25 COIs"
+requires-python = ">=3.9"
+
+[tool.vercel]
+entrypoint = "api.render_queue:handler"
