@@ -30,12 +30,11 @@ from typing import Optional
 
 # Defer heavy third-party imports so that a missing/broken dependency yields
 # a readable JSON 500 instead of Vercel's opaque FUNCTION_INVOCATION_FAILED.
-# We use psycopg2 (not psycopg 3) because Vercel's Python runtime ships
-# reliable pre-built psycopg2-binary wheels for every Lambda arch.
+# We use pg8000 (pure Python, no C deps) so it installs on any Vercel Python
+# runtime version without wheel resolution surprises.
 _import_error: Optional[str] = None
 try:
-    import psycopg2  # noqa: F401
-    from psycopg2.extras import Json  # noqa: F401
+    import pg8000.native  # noqa: F401
     import requests  # noqa: F401
     from pypdf import PdfReader, PdfWriter  # noqa: F401
     from pypdf.generic import BooleanObject, NameObject  # noqa: F401
@@ -275,30 +274,48 @@ def notify_requester(cert_id: str):
         return False
 
 
-def load_cert(cur, cert_id):
-    cur.execute("""
-      SELECT c.id, c.certificate_holder, c.named_insured, c.holder_address,
-             c.additional_insured, c.ai_name, c.ai_address, c.ai_endorsements,
-             c.effective_date, c.expiration_date, c.org_id,
-             row_to_json(p) AS policy_json,
-             row_to_json(o) AS org_json,
-             row_to_json(club) AS club_json
-        FROM certificates c
-        JOIN policies      p    ON p.id = c.policy_id
-        JOIN organizations o    ON o.id = c.org_id
-        LEFT JOIN organizations club ON club.id = c.club_org_id
-       WHERE c.id = %s
-    """, (cert_id,))
-    row = cur.fetchone()
-    if not row:
+def _connect():
+    """Parse DB_URL (postgresql://user:pass@host:port/db) and open a pg8000
+    native Connection. pg8000 doesn't accept a DSN string directly."""
+    from urllib.parse import urlparse, unquote
+    p = urlparse(DB_URL)
+    return pg8000.native.Connection(
+        user=unquote(p.username or ""),
+        password=unquote(p.password or ""),
+        host=p.hostname,
+        port=p.port or 5432,
+        database=(p.path or "/postgres").lstrip("/") or "postgres",
+        ssl_context=True,   # Supabase requires TLS
+    )
+
+
+def load_cert(conn, cert_id):
+    # pg8000.native uses :name placeholders and returns lists of rows.
+    rows = conn.run(
+        """
+        SELECT c.id, c.certificate_holder, c.named_insured, c.holder_address,
+               c.additional_insured, c.ai_name, c.ai_address, c.ai_endorsements,
+               c.effective_date, c.expiration_date, c.org_id,
+               row_to_json(p) AS policy_json,
+               row_to_json(o) AS org_json,
+               row_to_json(club) AS club_json
+          FROM certificates c
+          JOIN policies      p    ON p.id = c.policy_id
+          JOIN organizations o    ON o.id = c.org_id
+          LEFT JOIN organizations club ON club.id = c.club_org_id
+         WHERE c.id = :cid
+        """,
+        cid=cert_id,
+    )
+    if not rows:
         return None
     (cid, holder, ni, holder_addr, addl, ai_name, ai_addr, ai_ends,
-     eff, exp, org_id, policy, org, club) = row
+     eff, exp, org_id, policy, org, club) = rows[0]
     if (not holder_addr or holder_addr == {}) and club and (club.get("address") or {}):
         holder_addr = club["address"]
-        cur.execute(
-            "UPDATE certificates SET holder_address = %s WHERE id = %s",
-            (Json(holder_addr), cid),
+        conn.run(
+            "UPDATE certificates SET holder_address = CAST(:addr AS jsonb) WHERE id = :cid",
+            addr=json.dumps(holder_addr), cid=cid,
         )
     cert = {
         "id": cid, "certificate_holder": holder, "named_insured": ni,
@@ -312,8 +329,8 @@ def load_cert(cur, cert_id):
     return cert, policy, org
 
 
-def render_one(cur, cert_id: str) -> dict:
-    loaded = load_cert(cur, cert_id)
+def render_one(conn, cert_id: str) -> dict:
+    loaded = load_cert(conn, cert_id)
     if not loaded:
         return {"cert_id": cert_id, "ok": False, "error": "cert not found"}
     cert, policy, org = loaded
@@ -323,9 +340,9 @@ def render_one(cur, cert_id: str) -> dict:
         url = upload(str(cert["org_id"]), str(cert["id"]), pdf_bytes)
         if not url:
             return {"cert_id": cert_id, "ok": False, "error": "upload failed"}
-        cur.execute(
-            "UPDATE certificates SET document_url = %s, status = 'active' WHERE id = %s",
-            (url, cert["id"]),
+        conn.run(
+            "UPDATE certificates SET document_url = :url, status = 'active' WHERE id = :cid",
+            url=url, cid=cert["id"],
         )
         notify_requester(str(cert["id"]))
         return {"cert_id": cert_id, "ok": True, "url": url}
@@ -335,37 +352,32 @@ def render_one(cur, cert_id: str) -> dict:
 
 def drain_queue(batch_size: int) -> dict:
     results = []
-    conn = psycopg2.connect(DB_URL)
-    conn.autocommit = True
+    conn = _connect()
     try:
-        cur = conn.cursor()
-        cur.execute("""
-          SELECT certificate_id FROM coi_pdf_queue
-           WHERE finished_at IS NULL
-           ORDER BY enqueued_at
-           LIMIT %s
-        """, (batch_size,))
-        rows = cur.fetchall()
+        rows = conn.run(
+            "SELECT certificate_id FROM coi_pdf_queue "
+            "WHERE finished_at IS NULL ORDER BY enqueued_at LIMIT :n",
+            n=batch_size,
+        )
         for (cid,) in rows:
-            cur.execute(
+            conn.run(
                 "UPDATE coi_pdf_queue SET started_at = NOW(), attempts = attempts + 1 "
-                "WHERE certificate_id = %s",
-                (cid,),
+                "WHERE certificate_id = :cid",
+                cid=cid,
             )
-            result = render_one(cur, str(cid))
+            result = render_one(conn, str(cid))
             if result["ok"]:
-                cur.execute(
+                conn.run(
                     "UPDATE coi_pdf_queue SET finished_at = NOW(), last_error = NULL "
-                    "WHERE certificate_id = %s",
-                    (cid,),
+                    "WHERE certificate_id = :cid",
+                    cid=cid,
                 )
             else:
-                cur.execute(
-                    "UPDATE coi_pdf_queue SET last_error = %s WHERE certificate_id = %s",
-                    (result.get("error", "unknown"), cid),
+                conn.run(
+                    "UPDATE coi_pdf_queue SET last_error = :err WHERE certificate_id = :cid",
+                    err=result.get("error", "unknown"), cid=cid,
                 )
             results.append(result)
-        cur.close()
     finally:
         conn.close()
     return {"picked": len(results), "results": results}
