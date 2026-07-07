@@ -30,9 +30,12 @@ from typing import Optional
 
 # Defer heavy third-party imports so that a missing/broken dependency yields
 # a readable JSON 500 instead of Vercel's opaque FUNCTION_INVOCATION_FAILED.
+# We use psycopg2 (not psycopg 3) because Vercel's Python runtime ships
+# reliable pre-built psycopg2-binary wheels for every Lambda arch.
 _import_error: Optional[str] = None
 try:
-    import psycopg  # noqa: F401
+    import psycopg2  # noqa: F401
+    from psycopg2.extras import Json  # noqa: F401
     import requests  # noqa: F401
     from pypdf import PdfReader, PdfWriter  # noqa: F401
     from pypdf.generic import BooleanObject, NameObject  # noqa: F401
@@ -272,8 +275,8 @@ def notify_requester(cert_id: str):
         return False
 
 
-def load_cert(conn, cert_id):
-    row = conn.execute("""
+def load_cert(cur, cert_id):
+    cur.execute("""
       SELECT c.id, c.certificate_holder, c.named_insured, c.holder_address,
              c.additional_insured, c.ai_name, c.ai_address, c.ai_endorsements,
              c.effective_date, c.expiration_date, c.org_id,
@@ -285,16 +288,17 @@ def load_cert(conn, cert_id):
         JOIN organizations o    ON o.id = c.org_id
         LEFT JOIN organizations club ON club.id = c.club_org_id
        WHERE c.id = %s
-    """, (cert_id,)).fetchone()
+    """, (cert_id,))
+    row = cur.fetchone()
     if not row:
         return None
     (cid, holder, ni, holder_addr, addl, ai_name, ai_addr, ai_ends,
      eff, exp, org_id, policy, org, club) = row
     if (not holder_addr or holder_addr == {}) and club and (club.get("address") or {}):
         holder_addr = club["address"]
-        conn.execute(
+        cur.execute(
             "UPDATE certificates SET holder_address = %s WHERE id = %s",
-            (psycopg.types.json.Jsonb(holder_addr), cid),
+            (Json(holder_addr), cid),
         )
     cert = {
         "id": cid, "certificate_holder": holder, "named_insured": ni,
@@ -308,8 +312,8 @@ def load_cert(conn, cert_id):
     return cert, policy, org
 
 
-def render_one(conn, cert_id: str) -> dict:
-    loaded = load_cert(conn, cert_id)
+def render_one(cur, cert_id: str) -> dict:
+    loaded = load_cert(cur, cert_id)
     if not loaded:
         return {"cert_id": cert_id, "ok": False, "error": "cert not found"}
     cert, policy, org = loaded
@@ -319,7 +323,7 @@ def render_one(conn, cert_id: str) -> dict:
         url = upload(str(cert["org_id"]), str(cert["id"]), pdf_bytes)
         if not url:
             return {"cert_id": cert_id, "ok": False, "error": "upload failed"}
-        conn.execute(
+        cur.execute(
             "UPDATE certificates SET document_url = %s, status = 'active' WHERE id = %s",
             (url, cert["id"]),
         )
@@ -331,32 +335,39 @@ def render_one(conn, cert_id: str) -> dict:
 
 def drain_queue(batch_size: int) -> dict:
     results = []
-    with psycopg.connect(DB_URL, autocommit=True) as conn:
-        rows = conn.execute("""
+    conn = psycopg2.connect(DB_URL)
+    conn.autocommit = True
+    try:
+        cur = conn.cursor()
+        cur.execute("""
           SELECT certificate_id FROM coi_pdf_queue
            WHERE finished_at IS NULL
            ORDER BY enqueued_at
            LIMIT %s
-        """, (batch_size,)).fetchall()
+        """, (batch_size,))
+        rows = cur.fetchall()
         for (cid,) in rows:
-            conn.execute(
+            cur.execute(
                 "UPDATE coi_pdf_queue SET started_at = NOW(), attempts = attempts + 1 "
                 "WHERE certificate_id = %s",
                 (cid,),
             )
-            result = render_one(conn, str(cid))
+            result = render_one(cur, str(cid))
             if result["ok"]:
-                conn.execute(
+                cur.execute(
                     "UPDATE coi_pdf_queue SET finished_at = NOW(), last_error = NULL "
                     "WHERE certificate_id = %s",
                     (cid,),
                 )
             else:
-                conn.execute(
+                cur.execute(
                     "UPDATE coi_pdf_queue SET last_error = %s WHERE certificate_id = %s",
                     (result.get("error", "unknown"), cid),
                 )
             results.append(result)
+        cur.close()
+    finally:
+        conn.close()
     return {"picked": len(results), "results": results}
 
 
